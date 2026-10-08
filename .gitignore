@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+build/
+dist/
+release/
+qa/
+cache/
+tests/fixtures/
+*.exe
+*.zip
+*.log
+*.ini
+安装结果.json

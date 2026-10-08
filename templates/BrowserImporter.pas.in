@@ -1,0 +1,146 @@
+// MyLibrary 0.5: initialize paths inside each entry invocation.
+
+procedure TraceNativeStage(Stage : String);
+var Data : TStringList;
+begin
+    Data := TStringList.Create;
+    try
+        Data.Add(Stage);
+        Data.SaveToFile('@@LIBROOT@@\native-stage.txt');
+    finally
+        Data.Free;
+    end;
+end;
+
+function SaveNativeSource(Path, Kind, FormatName : String) : Boolean;
+var Document : IServerDocument;
+begin
+    Result := False;
+    Document := Client.GetDocumentByPath(Path);
+    if Document <> Nil then begin
+        if Document.Modified then begin ShowMessage('Save your library edits first: ' + Path); Exit; end;
+        Client.CloseDocument(Document);
+        if Client.GetDocumentByPath(Path) <> Nil then begin ShowMessage('Close the source library before reloading: ' + Path); Exit; end;
+    end;
+    Document := Client.OpenDocument(Kind, Path);
+    if Document = Nil then Exit;
+    Client.ShowDocument(Document);
+    Document.Modified := True;
+    Result := Document.DoFileSave(FormatName);
+end;
+
+function CompileLibraryResponse(Path, ExpectedJobId : String) : Boolean;
+var Reply, ResultFile : TStringList; Project : IProject; Manager : IIntegratedLibraryManager; LibraryPath, SourcePath, Name, Footprint : String; I, Count, Expected : Integer;
+begin
+    Result := False;
+    Reply := TStringList.Create;
+    try
+        Reply.LoadFromFile(Path);
+        if ExpectedJobId <> '' then if Reply.Values['job_id'] <> ExpectedJobId then begin ShowMessage('The response does not match this import request.'); Exit; end;
+        if Reply.Values['status'] <> 'ok' then begin
+            if Reply.Values['error'] <> 'cancelled' then ShowMessage(Reply.Values['error']);
+            Exit;
+        end;
+        Manager := IntegratedLibraryManager;
+        if Manager = Nil then begin ShowMessage('Integrated library manager is unavailable.'); Exit; end;
+        TraceNativeStage('Saving schematic source');
+        if not SaveNativeSource(Reply.Values['schlib'], 'SCHLIB', 'Advanced Schematic binary library') then begin ShowMessage('Native MyParts save failed.'); Exit; end;
+        TraceNativeStage('Saving PCB source');
+        if not SaveNativeSource(Reply.Values['pcblib'], 'PCBLIB', 'PCB Library File') then begin ShowMessage('Native MyFootprints save failed.'); Exit; end;
+        TraceNativeStage('Opening library project');
+        Project := GetWorkspace.DM_OpenProject(Reply.Values['project'], False);
+        if Project = Nil then begin ShowMessage('Cannot open MyLibrary.LibPkg.'); Exit; end;
+        Count := StrToInt(Reply.Values['remove_document_count']);
+        for I := 0 to Count - 1 do begin
+            SourcePath := Reply.Values['remove_document' + IntToStr(I)];
+            if Project.DM_IndexOfSourceDocument(SourcePath) >= 0 then Project.DM_RemoveSourceDocument(SourcePath);
+        end;
+        Count := StrToInt(Reply.Values['document_count']);
+        for I := 0 to Count - 1 do begin
+            SourcePath := Reply.Values['document' + IntToStr(I)];
+            if Project.DM_IndexOfSourceDocument(SourcePath) < 0 then Project.DM_AddSourceDocument(SourcePath);
+        end;
+        LibraryPath := Reply.Values['intlib'];
+        Expected := StrToInt(Reply.Values['expected_components']);
+        Project.DM_SetAsCurrentProject;
+        TraceNativeStage('Compiling library');
+        if not Project.DM_Compile then begin ShowMessage('MyLibrary compilation failed. Review AD Messages.'); Exit; end;
+        if not FileExists(LibraryPath) then begin ShowMessage('The compiled library is missing.'); Exit; end;
+        TraceNativeStage('Installing library');
+        Manager.InstallLibrary(LibraryPath);
+        if Manager.GetComponentCount(LibraryPath) <> Expected then begin ShowMessage('Compiled component count differs from the source libraries.'); Exit; end;
+        TraceNativeStage('Verifying default footprints');
+        Count := StrToInt(Reply.Values['binding_count']);
+        for I := 0 to Count - 1 do begin
+            Name := Reply.Values['binding_name' + IntToStr(I)];
+            Footprint := Reply.Values['binding_footprint' + IntToStr(I)];
+            if Manager.ModelCount(Name, LibraryPath, 'PCBLIB') <> 1 then begin ShowMessage('Default footprint is missing: ' + Name); Exit; end;
+            if Manager.ModelName(Name, LibraryPath, 'PCBLIB', 0) <> Footprint then begin ShowMessage('Default footprint differs: ' + Name); Exit; end;
+        end;
+        ResultFile := TStringList.Create;
+        try
+            ResultFile.Add('compiled_library=' + LibraryPath);
+            ResultFile.Add('symbol=' + Reply.Values['symbol']);
+            ResultFile.Add('footprint=' + Reply.Values['footprint']);
+            ResultFile.Add('native_compile_and_model_query=passed');
+            ResultFile.Add('placement_api_returned_true=not_run');
+            ResultFile.Add('visual_3d_alignment=not_verified');
+            ResultFile.Add('job_id=' + Reply.Values['job_id']);
+            ResultFile.Add('component_count=' + IntToStr(Expected));
+            ResultFile.SaveToFile(ExtractFilePath(LibraryPath) + 'native-ad-result.ini');
+        finally
+            ResultFile.Free;
+        end;
+        Result := True;
+        TraceNativeStage('Native operations passed; displaying completion');
+        ShowMessage('MyLibrary updated: ' + Reply.Values['symbol'] + #13 + IntToStr(Expected) + ' components. Native save, compile and default footprints passed (100%).' + #13 + 'Place from Components > MyLibrary.IntLib.');
+    finally
+        Reply.Free;
+    end;
+    TraceNativeStage('Completed');
+end;
+
+procedure ImportToMyLibrary;
+var Request : TStringList; SourceDocument : IServerDocument; JobId, ReplyPath, BridgeExecutable, BridgeRoot, MyLibraryRoot : String; ExitCode : Integer; Started : Double;
+begin
+    BridgeExecutable := '@@EXECUTABLE@@';
+    BridgeRoot := '@@ROOT@@';
+    MyLibraryRoot := '@@LIBROOT@@';
+    SourceDocument := Client.GetDocumentByPath(MyLibraryRoot + '\MyParts.SchLib');
+    if SourceDocument <> Nil then if SourceDocument.Modified then begin ShowMessage('Save MyParts.SchLib first.'); Exit; end;
+    SourceDocument := Client.GetDocumentByPath(MyLibraryRoot + '\MyFootprints.PcbLib');
+    if SourceDocument <> Nil then if SourceDocument.Modified then begin ShowMessage('Save MyFootprints.PcbLib first.'); Exit; end;
+    if not FileExists(BridgeExecutable) then begin ShowMessage('Cannot find the launcher:' + #13 + BridgeExecutable + #13 + 'Close AD and run LCSC_AD_Setup.exe to repair this installation.'); Exit; end;
+    JobId := GetWorkspace.DM_GenerateUniqueID;
+    ReplyPath := BridgeRoot + '\response_' + JobId + '.ini';
+    Request := TStringList.Create;
+    try
+        Request.Add('job_id=' + JobId);
+        Request.Add('mode=browser');
+        Request.Add('code=C725895');
+        Request.SaveToFile(BridgeRoot + '\job_' + JobId + '.ini');
+    finally
+        Request.Free;
+    end;
+    try
+        ExitCode := RunApplication('"' + BridgeExecutable + '" --job ' + JobId);
+    except
+        ShowMessage('Cannot start the search window. Check ad-launcher.log.');
+        Exit;
+    end;
+    if ExitCode <> 0 then begin ShowMessage('Cannot start the search window: ' + GetErrorMessage(ExitCode)); Exit; end;
+    Started := Now;
+    while not FileExists(ReplyPath) do begin
+        Sleep(100);
+        Application.ProcessMessages;
+        if (Now - Started) * 86400 > 1800 then begin ShowMessage('The search window timed out. Close it, then run RebuildMyLibrary if an import already completed.'); Exit; end;
+    end;
+    CompileLibraryResponse(ReplyPath, JobId);
+end;
+
+procedure RebuildMyLibrary;
+begin
+    CompileLibraryResponse('@@LIBROOT@@\LCSC-import-pending.ini', '');
+end;
+
+End.

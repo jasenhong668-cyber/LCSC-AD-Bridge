@@ -1,0 +1,12 @@
+﻿[Design]
+Version=1.0
+OutputPath=Compiled
+
+[Document1]
+DocumentPath=MyParts.SchLib
+
+[Document2]
+DocumentPath=MyFootprints.PcbLib
+
+[Generic_EDE]
+OutputDir=Compiled

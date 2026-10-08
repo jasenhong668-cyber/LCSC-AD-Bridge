@@ -1,0 +1,198 @@
+const
+    BridgeExecutable = '@@EXECUTABLE@@';
+    BridgeRoot = '@@ROOT@@';
+    BridgeCache = '@@CACHE@@';
+
+var LCSCImportForm : TLCSCImportForm;
+    BridgeJobId, BridgeReplyPath : String;
+    BridgePollTicks : Integer;
+
+function ValidCode(Code : String) : Boolean;
+var I : Integer;
+begin
+    Result := False;
+    if (Length(Code) < 2) or (Length(Code) > 13) then Exit;
+    if Code[1] <> 'C' then Exit;
+    for I := 2 to Length(Code) do if (Code[I] < '0') or (Code[I] > '9') then Exit;
+    Result := Code[2] <> '0';
+end;
+
+procedure TLCSCImportForm.FormShow(Sender : TObject);
+var RequiredWidth, RequiredHeight, Edge, Gap : Integer;
+begin
+    Gap := CodeEdit.Left;
+    if Gap < 16 then Gap := 16;
+    RequiredWidth := CodeEdit.Left + CodeEdit.Width;
+    Edge := CodeLabel.Left + CodeLabel.Width;
+    if Edge > RequiredWidth then RequiredWidth := Edge;
+    Edge := StatusLabel.Left + StatusLabel.Width;
+    if Edge > RequiredWidth then RequiredWidth := Edge;
+    Edge := StartButton.Left + StartButton.Width;
+    if Edge > RequiredWidth then RequiredWidth := Edge;
+    Edge := CancelButton.Left + CancelButton.Width;
+    if Edge > RequiredWidth then RequiredWidth := Edge;
+    RequiredWidth := RequiredWidth + Gap;
+    RequiredHeight := CancelButton.Top + CancelButton.Height + Gap;
+    Edge := StartButton.Top + StartButton.Height + Gap;
+    if Edge > RequiredHeight then RequiredHeight := Edge;
+    Edge := StatusLabel.Top + StatusLabel.Height + Gap;
+    if Edge > RequiredHeight then RequiredHeight := Edge;
+    if ClientWidth < RequiredWidth then ClientWidth := RequiredWidth;
+    if ClientHeight < RequiredHeight then ClientHeight := RequiredHeight;
+end;
+
+procedure TLCSCImportForm.StartButtonClick(Sender : TObject);
+var Code : String;
+    Request : TStringList;
+begin
+    Code := UpperCase(Trim(CodeEdit.Text));
+    if not ValidCode(Code) then begin ShowMessage('Enter an LCSC code such as C8734.'); Exit; end;
+    if not FileExists(BridgeExecutable) then begin ShowMessage('The launcher is missing. Run setup.cmd again.'); Exit; end;
+    BridgeJobId := GetWorkspace.DM_GenerateUniqueID;
+    BridgeReplyPath := BridgeRoot + '\response_' + BridgeJobId + '.ini';
+    Request := TStringList.Create;
+    try
+        Request.Add('job_id=' + BridgeJobId);
+        Request.Add('code=' + Code);
+        Request.SaveToFile(BridgeRoot + '\job_' + BridgeJobId + '.ini');
+    finally
+        Request.Free;
+    end;
+    BridgePollTicks := 0;
+    CodeEdit.Enabled := False;
+    StartButton.Enabled := False;
+    StatusLabel.Caption := 'Downloading and checking symbol, footprint and STEP...';
+    try
+        RunApplication(BridgeExecutable);
+        PollTimer.Enabled := True;
+    except
+        CodeEdit.Enabled := True;
+        StartButton.Enabled := True;
+        StatusLabel.Caption := 'Cannot start the launcher. Check ad-launcher.log.';
+    end;
+end;
+
+procedure TLCSCImportForm.PollTimerTimer(Sender : TObject);
+var Reply : TStringList;
+    ErrorText : String;
+begin
+    BridgePollTicks := BridgePollTicks + 1;
+    if BridgePollTicks > 1000 then begin
+        PollTimer.Enabled := False;
+        CodeEdit.Enabled := True;
+        StartButton.Enabled := True;
+        StatusLabel.Caption := 'Timed out. Check ad-launcher.log in the plugin folder.';
+        Exit;
+    end;
+    if not FileExists(BridgeReplyPath) then Exit;
+    Reply := TStringList.Create;
+    try
+        Reply.LoadFromFile(BridgeReplyPath);
+        if Reply.Values['job_id'] <> BridgeJobId then Exit;
+        PollTimer.Enabled := False;
+        if Reply.Values['status'] = 'ok' then ModalResult := mrOk
+        else begin
+            ErrorText := Reply.Values['error'];
+            CodeEdit.Enabled := True;
+            StartButton.Enabled := True;
+            StatusLabel.Caption := 'Import stopped: ' + ErrorText;
+            ShowMessage(ErrorText);
+        end;
+    finally
+        Reply.Free;
+    end;
+end;
+
+procedure TLCSCImportForm.CancelButtonClick(Sender : TObject);
+begin
+    PollTimer.Enabled := False;
+    ModalResult := mrCancel;
+end;
+
+procedure ImportComponent(PlaceNow : Boolean);
+var ProjectPath, LibraryPath, SymbolName, FootprintName, SheetPath, InstalledPath : String;
+    Reply : TStringList;
+    Project, OriginalProject : IProject;
+    Manager : IIntegratedLibraryManager;
+    Sheet : ISch_Document;
+    X, Y, I, DialogResult : Integer;
+begin
+    Manager := IntegratedLibraryManager;
+    if Manager = Nil then begin ShowMessage('Integrated library manager is unavailable.'); Exit; end;
+    SheetPath := '';
+    OriginalProject := GetWorkspace.DM_FocusedProject;
+    if PlaceNow then begin
+        if SchServer = Nil then begin ShowMessage('Open a schematic sheet first.'); Exit; end;
+        Sheet := SchServer.GetCurrentSchDocument;
+        if Sheet = Nil then begin ShowMessage('Open a schematic sheet first.'); Exit; end;
+        SheetPath := Sheet.DocumentName;
+        if UpperCase(ExtractFileExt(SheetPath)) <> '.SCHDOC' then begin ShowMessage('Open a saved .SchDoc sheet first.'); Exit; end;
+    end;
+    LCSCImportForm.PollTimer.Enabled := False;
+    LCSCImportForm.CodeEdit.Enabled := True;
+    LCSCImportForm.StartButton.Enabled := True;
+    LCSCImportForm.StatusLabel.Caption := 'Enter an LCSC code and click Import.';
+    LCSCImportForm.Visible := False;
+    DialogResult := LCSCImportForm.ShowModal;
+    LCSCImportForm.PollTimer.Enabled := False;
+    if DialogResult <> mrOk then Exit;
+    Reply := TStringList.Create;
+    try
+        Reply.LoadFromFile(BridgeReplyPath);
+        if (Reply.Values['status'] <> 'ok') or (Reply.Values['job_id'] <> BridgeJobId) then begin ShowMessage('Import response does not match this request.'); Exit; end;
+        ProjectPath := Reply.Values['project'];
+        LibraryPath := Reply.Values['intlib'];
+        SymbolName := Reply.Values['symbol'];
+        FootprintName := Reply.Values['footprint'];
+    finally
+        Reply.Free;
+    end;
+    Project := GetWorkspace.DM_OpenProject(ProjectPath, False);
+    if Project = Nil then begin ShowMessage('Cannot open the generated library project: ' + ProjectPath); Exit; end;
+    try
+        Manager.CreateIntegratedLibrary(Project, LibraryPath, True);
+        if not FileExists(LibraryPath) then begin ShowMessage('Library compilation failed. Review the AD Messages panel.'); Exit; end;
+        if Manager.GetComponentCount(LibraryPath) <> 1 then begin ShowMessage('Compiled library has an unexpected component count.'); Exit; end;
+        if Manager.ModelCount(SymbolName, LibraryPath, 'PCBLIB') <> 1 then begin ShowMessage('Compiled component does not have exactly one footprint.'); Exit; end;
+        if Manager.ModelName(SymbolName, LibraryPath, 'PCBLIB', 0) <> FootprintName then begin ShowMessage('Compiled footprint name does not match the downloaded component.'); Exit; end;
+        for I := Manager.InstalledLibraryCount - 1 downto 0 do begin
+            InstalledPath := Manager.InstalledLibraryPath(I);
+            if (UpperCase(ExtractFileName(InstalledPath)) = UpperCase(ExtractFileName(LibraryPath))) and (UpperCase(InstalledPath) <> UpperCase(LibraryPath)) and (Pos(UpperCase(BridgeCache + '\bound\'), UpperCase(InstalledPath)) = 1) then Manager.UninstallLibrary(InstalledPath);
+        end;
+        Manager.InstallLibrary(LibraryPath);
+        if PlaceNow then begin
+            if OriginalProject <> Nil then OriginalProject.DM_SetAsCurrentProject;
+            Client.ShowDocument(Client.OpenDocument('SCH', SheetPath));
+            X := MilsToCoord(1000);
+            Y := MilsToCoord(1000);
+            if not Manager.PlaceLibraryComponent(SymbolName, LibraryPath, 'Orientation=0|Location.X=' + IntToStr(X) + '|Location.Y=' + IntToStr(Y)) then begin ShowMessage('Installed successfully. Place the component from the Components panel.'); Exit; end;
+            SchServer.GetCurrentSchDocument.GraphicallyInvalidate;
+        end else ShowMessage('Installed: ' + SymbolName + #13 + LibraryPath);
+        Reply := TStringList.Create;
+        try
+            Reply.Add('compiled_library=' + LibraryPath);
+            Reply.Add('symbol=' + SymbolName);
+            Reply.Add('footprint=' + FootprintName);
+            Reply.Add('native_compile_and_model_query=passed');
+            if PlaceNow then Reply.Add('placement_api_returned_true=True') else Reply.Add('placement_api_returned_true=not_run');
+            Reply.Add('visual_3d_alignment=not_verified');
+            Reply.SaveToFile(ExtractFilePath(LibraryPath) + 'native-ad-result.ini');
+        finally
+            Reply.Free;
+        end;
+    finally
+        if OriginalProject <> Nil then OriginalProject.DM_SetAsCurrentProject;
+    end;
+end;
+
+procedure ImportAndPlace;
+begin
+    ImportComponent(True);
+end;
+
+procedure ImportToLibrary;
+begin
+    ImportComponent(False);
+end;
+
+End.
