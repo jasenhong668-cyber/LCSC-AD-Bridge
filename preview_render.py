@@ -15,10 +15,12 @@ def fit(points, size, margin=22):
 
 def coord(p, key): return float(p.get(key, 0)) + float(p.get(key + '_FRAC', 0)) / 100000
 
-def schematic(report, size=(480, 260)):
+def schematic(report, size=(480, 260), part=1):
     rows = main_library.components(bridge.read_streams(report.get('schlib', report['source_schlib'])))[0][1]
     shapes, points, pins = [], [], []
     for flag, data, p in rows:
+        owner = struct.unpack_from('<h', data, 5)[0] if flag and bridge.pin_number(flag, data, p) is not None else int(p.get('OWNERPARTID', '-1'))
+        if owner > 0 and owner != part: continue
         record = p.get('RECORD')
         if record == '2':
             visible = int(p.get('PINCONGLOMERATE', 0))
@@ -64,8 +66,8 @@ def schematic(report, size=(480, 260)):
     for x, y, end, dx, dy, name, number in pins:
         start, tip = transform(x, y), transform(*end)
         draw.line((start, tip), fill='#913537', width=2)
-        anchor = 'lm' if dx > 0 else 'rm' if dx < 0 else 'mm'
-        if name: draw.text(transform(end[0] + dx * 3, end[1] + dy * 3), name, fill='#223449', font=text_font, anchor=anchor)
+        anchor = 'rm' if dx > 0 else 'lm' if dx < 0 else 'mm'
+        if name: draw.text(transform(x - dx * 3, y - dy * 3), name, fill='#223449', font=text_font, anchor=anchor)
         if number: draw.text(((start[0] + tip[0]) / 2, (start[1] + tip[1]) / 2 - 5), number, fill='#436bb1', font=text_font, anchor='ms')
     return image
 

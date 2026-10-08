@@ -1,5 +1,5 @@
 """Search/select/preview window; only the explicit import action changes libraries."""
-import json, pathlib, queue, re, shutil, subprocess, threading, time
+import json, pathlib, queue, re, shutil, subprocess, threading, time, uuid, zlib
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from PIL import ImageTk
@@ -39,12 +39,42 @@ def prepare_preview(code, cache, progress):
     else:
         obj = next(source.glob('*.obj'), None)
         mesh = preview_render.obj_mesh(obj) if obj else None
+    return preview_report(report, mesh)
+
+def preview_report(report, mesh=None):
+    if mesh is None and report.get('model_placement'):
+        data = json.loads(pathlib.Path(report['model_placement']['preview_mesh']).read_text(encoding='utf-8'))
+        mesh = preview_render.with_footprint(report, (data['vertices'], data['faces']))
     images = [preview_render.schematic(report), preview_render.footprint(report), preview_render.model(mesh) if mesh else None]
     root = main_library.components(bridge.read_streams(report['source_schlib']))[0][1][0][2]
     description = root.get('%UTF8%COMPONENTDESCRIPTION', root.get('COMPONENTDESCRIPTION', ''))
     if '%UTF8%COMPONENTDESCRIPTION' in root: description = description.encode('latin1').decode('utf-8', errors='replace')
     else: description = description.encode('latin1').decode('gbk', errors='replace')
     return {'report': report, 'images': images, 'mesh': mesh, 'description': description}
+
+def replace_step(report, step, cache):
+    raw = pathlib.Path(step).read_bytes()
+    if not raw.lstrip().startswith(b'ISO-10303-21;') or b'END-ISO-10303-21;' not in raw: raise ValueError('请选择完整的 STEP 文件。')
+    pcb = bridge.read_streams(report['source_pcblib'])
+    models = list(bridge.records(pcb.get(('Library', 'Models', 'Data'), b'')))
+    if len(models) != 1: raise ValueError('替换 STEP 目前要求来源封装包含一个模型。')
+    root = pathlib.Path(cache) / 'overrides' / (report['lcsc'] + '_' + uuid.uuid4().hex[:8])
+    root.mkdir(parents=True, exist_ok=False)
+    for path in pathlib.Path(report['source_schlib']).parent.glob('*_symbol_easyeda.json'): shutil.copy2(path, root / path.name)
+    sch = root / 'Source.SchLib'; shutil.copy2(report['source_schlib'], sch)
+    metadata_path = next(pathlib.Path(report['source_pcblib']).parent.glob('*_footprint_easyeda.json'))
+    metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+    metadata['result']['model_3d'].update(title=pathlib.Path(step).stem, uri='')
+    (root / 'Source_footprint_easyeda.json').write_text(json.dumps(metadata), encoding='utf-8')
+    (root / 'Replacement.step').write_bytes(raw)
+    pcb[('Library', 'Models', '0')] = zlib.compress(raw)
+    model = models[0][2].copy(); model['NAME'] = 'Replacement.step'
+    pcb[('Library', 'Models', 'Data')] = bridge.params(model)
+    bridge.write_verified(root / 'Source.PcbLib', pcb)
+    result = bridge.prepare(sch, root / 'Source.PcbLib', root / 'bound', report['lcsc'], True, True)
+    result['manual_step_override'] = {'path': str(pathlib.Path(step).resolve()), 'sha256': bridge.sha(raw)}
+    pathlib.Path(root / 'bound/binding-report.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+    return preview_report(result)
 
 class Browser:
     def __init__(self, config, request, reply):
@@ -113,10 +143,16 @@ class Browser:
             canvas.grid(row=1, column=0, sticky='nsew')
             canvas.bind('<Configure>', lambda event, index=i: self.draw(index))
             self.canvases.append(canvas)
-            if i == 2:
-                self.rotate_button = ttk.Button(frame, text='旋转 45°', command=self.rotate, state='disabled')
-                self.rotate_button.grid(row=0, column=1, padx=(6, 0))
+            if i == 0:
+                self.part_button = ttk.Button(frame, text='切换单元', command=self.next_part, state='disabled')
+                self.part_button.grid(row=0, column=1, padx=(6, 0))
                 canvas.grid(columnspan=2)
+            if i == 2:
+                self.step_button = ttk.Button(frame, text='替换 STEP…', command=self.choose_step, state='disabled')
+                self.step_button.grid(row=0, column=1, padx=(6, 0))
+                self.rotate_button = ttk.Button(frame, text='旋转 45°', command=self.rotate, state='disabled')
+                self.rotate_button.grid(row=0, column=2, padx=(6, 0))
+                canvas.grid(columnspan=3)
         bottom = ttk.Frame(self.root, padding=15)
         bottom.grid(row=2, column=0, columnspan=2, sticky='ew')
         bottom.columnconfigure(0, weight=1)
@@ -174,14 +210,19 @@ class Browser:
         report = prepared['report']
         self.images = prepared['images']
         self.angle = 32
+        self.symbol_part = 1
+        unit_count = report.get('symbol_units', {}).get('count', 1)
+        self.part_button.configure(text=f'单元 1/{unit_count} · 切换', state='normal' if unit_count > 1 else 'disabled')
         self.set_busy(False)
         self.rotate_button.configure(state='normal' if prepared['mesh'] else 'disabled')
+        self.step_button.configure(state='normal' if report['embedded_models'] else 'disabled')
         self.import_button.configure(state='normal' if report['embedded_models'] and report['bodies'] else 'disabled')
         values = self.results[code]
         self.tree.item(code, values=(code, '✓', '✓' if report['embedded_models'] else '—', report['symbol'], ' '.join(prepared['description'].split())[:180] or values['manufacturer']))
         self.detail.configure(state='normal')
         self.detail.delete('1.0', 'end')
-        self.detail.insert('end', f"{report['symbol']}  ·  {code}\n封装：{report['footprint']}\n引脚 / 焊盘：{report['unique_pin_count']} / {report['unique_pad_count']}  ·  STEP：{'已校验' if report['embedded_models'] else '缺失，不能导入'}\n{prepared['description']}")
+        source_model = (report.get('model_placement') or {}).get('source_model', {}).get('title', '')
+        self.detail.insert('end', f"{report['symbol']}  ·  {code}\n封装：{report['footprint']}\n引脚 / 焊盘：{report['unique_pin_count']} / {report['unique_pad_count']}  ·  单元：{unit_count}  ·  STEP：{'文件及绑定已校验' if report['embedded_models'] else '缺失，不能导入'}\n来源模型：{source_model or '未提供模型名称'}\n{prepared['description']}")
         self.detail.configure(state='disabled')
         self.progress.configure(value=100)
         self.status.set('预览已就绪。确认元件后点击“导入主库”；AD 将继续完成原生编译。')
@@ -207,6 +248,23 @@ class Browser:
         self.angle = (self.angle + 45) % 360
         self.images[2] = preview_render.model(mesh, angle=self.angle)
         self.draw(2)
+
+    def next_part(self):
+        if self.current is None or self.busy: return
+        report = self.prepared[self.current]['report']
+        count = report.get('symbol_units', {}).get('count', 1)
+        self.symbol_part = self.symbol_part % count + 1
+        self.images[0] = preview_render.schematic(report, part=self.symbol_part)
+        self.part_button.configure(text=f'单元 {self.symbol_part}/{count} · 切换')
+        self.draw(0)
+
+    def choose_step(self):
+        if self.current is None or self.busy: return
+        path = filedialog.askopenfilename(parent=self.root, title='选择正确的 STEP 模型（沿用来源封装的尺寸与旋转，请核对预览）', filetypes=[('STEP 模型', '*.step *.stp')])
+        if not path: return
+        code = self.current; report = self.prepared[code]['report']
+        self.set_busy(True, '正在校验并对齐替换模型，请在导入前核对方向和引脚…')
+        self.worker('preview', lambda: (code, replace_step(report, path, self.config['cache'])))
 
     def import_part(self):
         if self.current is None or self.busy: return

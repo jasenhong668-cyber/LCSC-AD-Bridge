@@ -94,11 +94,13 @@ def normalize(pcb, footprint_key, source_dir, cache_dir):
         if not normalized.lstrip().startswith(b'ISO-10303-21;') or b'END-ISO-10303-21;' not in normalized: raise ValueError('Normalized STEP is invalid')
         pcb[('Library', 'Models', '0')] = zlib.compress(normalized)
         model = models[0][2].copy()
-        for field in ('ROTX', 'ROTY', 'ROTZ', 'DZ'): model[field] = '0'
+        for field in ('ROTX', 'ROTY', 'ROTZ', 'DZ', 'CHECKSUM'): model[field] = '0'
         pcb[('Library', 'Models', 'Data')] = bridge.params(model)
         pcb[(footprint_key, 'Data')], count = replace_primitives(pcb[(footprint_key, 'Data')], {model_id})
         step_path = pathlib.Path(cache_dir) / 'normalized.step'
         step_path.write_bytes(normalized)
         mesh_path = pathlib.Path(cache_dir) / 'preview-mesh.json'
         mesh_path.write_bytes((folder / 'preview-mesh.json').read_bytes())
-        return {**report, 'source_step_sha256': bridge.sha(raw), 'normalized_step_sha256': bridge.sha(normalized), 'normalized_body_count': count, 'source_transform': values, 'normalized_step': str(step_path), 'preview_mesh': str(mesh_path)}
+        metadata = json.loads(next(pathlib.Path(source_dir).glob('*_footprint_easyeda.json')).read_text(encoding='utf-8'))
+        source_model = metadata.get('result', {}).get('model_3d', {})
+        return {**report, 'source_step_sha256': bridge.sha(raw), 'normalized_step_sha256': bridge.sha(normalized), 'normalized_body_count': count, 'source_transform': values, 'source_model': {'title': source_model.get('title', ''), 'uri': source_model.get('uri', '')}, 'normalized_step': str(step_path), 'preview_mesh': str(mesh_path)}

@@ -31,16 +31,26 @@ def bind(rows, footprint):
     return data
 
 def native_empty_placeholder(sch, pcb):
-    if footprints(pcb) or pcb.get(('Library', 'Models', 'Data'), b'') or pcb.get(('Library', 'Models', 'Header'), b'\0' * 4) != b'\0' * 4: return None
+    patterns = footprints(pcb)
+    if patterns and native_empty_footprint(pcb) is None: return None
+    if pcb.get(('Library', 'Models', 'Data'), b'') or pcb.get(('Library', 'Models', 'Header'), b'\0' * 4) != b'\0' * 4: return None
     parts = components(sch)
     if len(parts) != 1: return None
     key, rows = parts[0]
-    if key != ('Component_1', 'Data') or {k for k in sch if k[0] == key[0]} != {key}: return None
+    if key[0].upper() != 'COMPONENT_1' or {k for k in sch if k[0] == key[0]} != {key}: return None
     if [p.get('RECORD') for _, _, p in rows] != ['1', '34', '41', '44'] or any(flag for flag, _, _ in rows): return None
     header, designator, comment, models = [p for _, _, p in rows]
-    if header.get('LIBREFERENCE') != 'Component_1' or header.get('COMPONENTDESCRIPTION', '') or header.get('PARTCOUNT') != '2': return None
+    if header.get('LIBREFERENCE', '').upper() != 'COMPONENT_1' or header.get('COMPONENTDESCRIPTION', '') or header.get('PARTCOUNT') != '2': return None
     if designator.get('NAME') != 'Designator' or designator.get('TEXT') != '*' or comment.get('NAME') != 'Comment' or comment.get('TEXT') != '*': return None
     if models != {'RECORD': '44'}: return None
+    return key
+
+
+def native_empty_footprint(pcb):
+    patterns = footprints(pcb)
+    if len(patterns) != 1: return None
+    name, key = next(iter(patterns.items()))
+    if name.upper() != 'PCBCOMPONENT_1' or list(bridge.footprint_primitives(pcb[(key, 'Data')])): return None
     return key
 
 def validate(sch, pcb):
@@ -48,6 +58,7 @@ def validate(sch, pcb):
     patterns = footprints(pcb)
     report = []
     for key, rows in components(sch):
+        bridge.check_symbol_units(rows)
         name = rows[0][2].get('LIBREFERENCE', key[0])
         current = [p for _, _, p in rows if p.get('RECORD') == '45' and p.get('MODELTYPE', '').upper() == 'PCBLIB' and p.get('ISCURRENT', '').upper() in ('T', 'TRUE')]
         if len(current) != 1: raise ValueError(f'{name} must have exactly one default PCB footprint')
@@ -116,10 +127,17 @@ def add_footprint(pcb, incoming, code, desired):
     source_name, source_key = next(iter(footprints(incoming).items()))
     name = desired
     if name in patterns:
-        if pcb[(patterns[name], 'Data')] == incoming[(source_key, 'Data')]: return name
+        if identical_footprint(pcb, patterns[name], incoming, source_key): return name
         name = desired + '_' + code
-    if name in patterns: raise ValueError('An incompatible footprint with this LCSC code already exists')
+    if name in patterns:
+        if identical_footprint(pcb, patterns[name], incoming, source_key): return name
+        digest = bridge.sha(incoming[(source_key, 'Data')] + incoming.get(('Library', 'Models', '0'), b''))[:8]
+        name = desired + '_' + code + '_' + digest
+        if name in patterns:
+            if identical_footprint(pcb, patterns[name], incoming, source_key): return name
+            raise ValueError('An incompatible footprint with this LCSC code already exists')
     target_key = name if len(name) <= 31 and name not in {key[0] for key in pcb} else 'LCSC_' + code
+    if target_key in {key[0] for key in pcb}: target_key = 'LCSC_' + code + '_' + bridge.sha(name.encode('latin1'))[:8]
     if target_key in {key[0] for key in pcb}: raise ValueError('PCB storage-name collision')
     models = list(bridge.records(incoming[('Library', 'Models', 'Data')]))
     existing_models = list(bridge.records(pcb[('Library', 'Models', 'Data')]))
@@ -146,6 +164,17 @@ def add_footprint(pcb, incoming, code, desired):
         pcb[(target_key,) + key[1:]] = data
     update_pcb_index(pcb)
     return name
+
+
+def identical_footprint(pcb, key, incoming, source_key):
+    if pcb[(key, 'Data')] != incoming[(source_key, 'Data')]: return False
+    signatures = []
+    for streams, storage in ((pcb, key), (incoming, source_key)):
+        models, bodies = bridge.inspect_models(streams, list(bridge.footprint_primitives(streams[(storage, 'Data')])), False)
+        used = {body['model_id'] for body in bodies}
+        metadata = {p['ID']: p for _, _, p in bridge.records(streams.get(('Library', 'Models', 'Data'), b''))}
+        signatures.append({m['id']: (m['step_sha256'], tuple(metadata[m['id']].get(field, '0') for field in ('ROTX', 'ROTY', 'ROTZ', 'DZ'))) for m in models if m['id'] in used})
+    return signatures[0] == signatures[1]
 
 def add_symbol(sch, incoming, name, footprint):
     parts = components(incoming)
@@ -178,20 +207,29 @@ def refresh_existing(sch, pcb, key, rows, footprint, report):
     normalized = incoming[('Library', 'Models', '0')]
     if bridge.sha(zlib.decompress(normalized)) != placement['normalized_step_sha256']: raise ValueError('Normalized STEP checksum changed')
     if current != placement['normalized_step_sha256']:
-        pcb[('Library', 'Models', str(index))] = normalized
         new_model_id = '{' + str(uuid.uuid4()).upper() + '}'
         records = list(bridge.records(pcb[('Library', 'Models', 'Data')]))
+        shared = any(storage != pattern and model['ID'].encode('latin1') in pcb[(storage, 'Data')] for storage in footprints(pcb).values())
+        target_index = len(records) if shared else index
+        pcb[('Library', 'Models', str(target_index))] = normalized
         data = bytearray()
         for position, (flag, payload, values) in enumerate(records):
-            if position == index:
+            if position == index and not shared:
                 values = values.copy()
                 values['ID'] = new_model_id
                 for field in ('ROTX', 'ROTY', 'ROTZ', 'DZ', 'CHECKSUM'): values[field] = '0'
                 data += bridge.params(values)
             else: data += bridge.block(payload, flag)
+        if shared:
+            values = model.copy(); values['ID'] = new_model_id
+            for field in ('ROTX', 'ROTY', 'ROTZ', 'DZ', 'CHECKSUM'): values[field] = '0'
+            data += bridge.params(values)
+            pcb[('Library', 'Models', 'Header')] = struct.pack('<I', len(records) + 1)
         pcb[('Library', 'Models', 'Data')] = bytes(data)
         pcb[(pattern, 'Data')], _ = component_geometry.replace_primitives(footprint_data, {model['ID']})
         pcb[(pattern, 'Data')] = pcb[(pattern, 'Data')].replace(b'|MODELID=' + model['ID'].encode('latin1'), b'|MODELID=' + new_model_id.encode('latin1'))
+    import symbol_parts
+    rows, units = symbol_parts.restore(rows, pathlib.Path(report['source_schlib']).parent)
     updated = bytearray()
     for flag, payload, values in rows:
         if flag and payload[:4] == struct.pack('<i', 2): payload = bridge.simplify_native_pin(payload)
@@ -259,6 +297,11 @@ def import_master(report, library_root):
     placeholder = native_empty_placeholder(sch, pcb)
     if placeholder:
         sch.pop(placeholder)
+        empty_footprint = native_empty_footprint(pcb)
+        if empty_footprint:
+            for key in list(pcb):
+                if key[0] == empty_footprint: del pcb[key]
+            update_pcb_index(pcb)
         update_sch_index(sch)
     before = components(sch)
     rebind_all(sch, pcb)
@@ -276,6 +319,11 @@ def import_master(report, library_root):
             key, rows = matched[0]
             symbol = rows[0][2].get('LIBREFERENCE', key[0])
             footprint = next(p['MODELNAME'] for _, _, p in rows if p.get('RECORD') == '45' and p.get('ISCURRENT', '').upper() in ('T', 'TRUE'))
+            shared = sum(any(p.get('RECORD') == '45' and p.get('MODELNAME') == footprint and p.get('ISCURRENT', '').upper() in ('T', 'TRUE') for _, _, p in part_rows) for _, part_rows in before) > 1
+            if report.get('manual_step_override') or (shared and report.get('model_placement')):
+                footprint = add_footprint(pcb, bridge.read_streams(report['pcblib']), code, report['footprint'])
+                sch[key] = bind(rows, footprint)
+                rows = list(bridge.records(sch[key]))
             if report.get('model_placement'): repaired = refresh_existing(sch, pcb, key, rows, footprint, report)
         else:
             symbol = report['symbol']

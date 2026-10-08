@@ -3,7 +3,7 @@ import argparse, ctypes, datetime, hashlib, io, json, os, pathlib, re, subproces
 import olefile
 import bridge, main_library
 
-PRODUCT, VERSION = 'LCSC_AD_Bridge', '0.5.0'
+PRODUCT, VERSION = 'LCSC_AD_Bridge', '0.5.1'
 BEGIN, END = '// BEGIN LCSC_AD_BRIDGE_INSTALL_V05', '// END LCSC_AD_BRIDGE_INSTALL_V05'
 PROFILE_NAME = re.compile(r'Altium Designer \{[0-9A-Fa-f-]{36}\}')
 MENUS = (('MNSchematicMenu', 'MNSchematic_Help10'), ('MNSchLibMenu', 'MNSchematic_SchLibMenuHelp10'), ('MNPCBMenu', 'MNPCB_Help10'), ('MNPCBLibMenu', 'MNPCBLib_Help10'), ('MNPCB3DRMenu', 'MNPCB3DR_Help10'), ('MNNoDocument', 'MNNoDocument_Help'))

@@ -3,7 +3,7 @@ import argparse, datetime, hashlib, json, os, pathlib, re, shutil, struct, subpr
 import olefile
 from cfb_native import write_cfb
 
-VERSION = '0.5.0'
+VERSION = '0.5.1'
 ROOT = pathlib.Path(sys.executable).parent if getattr(sys, 'frozen', False) else pathlib.Path(__file__).resolve().parent
 RESOURCES = pathlib.Path(getattr(sys, '_MEIPASS', ROOT))
 MODEL_RECORDS = {'44', '45', '46', '47', '48'}
@@ -96,6 +96,16 @@ def check_mapping(pins, pads):
     extra = sorted(set(pads) - set(pins))
     if not pins or not pads or missing or extra: raise ValueError(f'Pin/pad mapping is incomplete: missing pads={missing}; unmapped numbered pads={extra}')
 
+def check_symbol_units(rows):
+    count = int(rows[0][2].get('PARTCOUNT', '2')) - 1
+    if count < 1: raise ValueError('Symbol contains no usable unit')
+    owners = []
+    for flag, payload, values in rows[1:]:
+        owner = struct.unpack_from('<h', payload, 5)[0] if flag and pin_number(flag, payload, values) is not None else int(values.get('OWNERPARTID', '-1'))
+        if owner < -1 or owner > count: raise ValueError('Symbol primitive references a missing unit')
+        if pin_number(flag, payload, values) is not None: owners.append(owner)
+    return count, {part: sum(owner in (-1, 0, part) for owner in owners) for part in range(1, count + 1)}
+
 def inspect_models(pcb, primitives, require_3d):
     metadata = list(records(pcb.get(('Library', 'Models', 'Data'), b'')))
     expected = pcb.get(('Library', 'Models', 'Header'), b'\0' * 4)
@@ -109,6 +119,7 @@ def inspect_models(pcb, primitives, require_3d):
         if not inflater.eof or inflater.unused_data or inflater.unconsumed_tail: raise ValueError('Invalid or oversized embedded STEP data')
         if not step.lstrip().startswith(b'ISO-10303-21;') or b'END-ISO-10303-21;' not in step: raise ValueError('Embedded model is not a complete STEP file')
         models.append({'id': p['ID'], 'name': p.get('NAME', ''), 'step_bytes': len(step), 'step_sha256': sha(step), 'compressed_sha256': sha(compressed)})
+    if len({model['id'] for model in models}) != len(models): raise ValueError('Duplicate embedded model IDs can bind the wrong STEP')
     bodies = []
     for kind, payload in primitives:
         if kind != 12: continue
@@ -142,6 +153,10 @@ def prepare(sch_path, pcb_path, output, code=None, require_3d=True, require_sour
     model_start = next((i for i, row in enumerate(rows) if row[2].get('RECORD') in MODEL_RECORDS), len(rows))
     if any(p.get('RECORD') not in MODEL_RECORDS for _, _, p in rows[model_start:]): raise ValueError('Model records interleave with symbol graphics; automatic rebinding refused')
     geometry = rows[:model_start]
+    import symbol_parts
+    geometry, units = symbol_parts.restore(geometry, sch_path.parent)
+    check_symbol_units(geometry)
+    rows = geometry + rows[model_start:]
     pins = [number for flag, payload, p in geometry if (number := pin_number(flag, payload, p)) is not None]
     if any(not number for number in pins): raise ValueError('Schematic has an unnamed pin')
     primitives = list(footprint_primitives(pcb[(fp_key, 'Data')]))
@@ -177,6 +192,10 @@ def prepare(sch_path, pcb_path, output, code=None, require_3d=True, require_sour
     for pin in dict.fromkeys(pins): data += params({'RECORD': 47, 'OWNERINDEX': count + 2, 'DESINTF': pin, 'DESIMPCOUNT': 1, 'DESIMP0': pin, 'ISTRIVIAL': 'T', 'UNIQUEID': uid()})
     data += params({'RECORD': 48, 'OWNERINDEX': count + 1})
     sch[key] = data
+    if units:
+        header = fields(sch[('FileHeader',)][4:4 + (struct.unpack_from('<I', sch[('FileHeader',)])[0] & 0xffffff)])
+        header['PARTCOUNT0'] = str(units['count'] + 1)
+        sch[('FileHeader',)] = params(header)
     update_sch_weight(sch)
     write_verified(output / 'Part.SchLib', sch)
     write_verified(output / 'Footprint.PcbLib', pcb)
@@ -185,6 +204,7 @@ def prepare(sch_path, pcb_path, output, code=None, require_3d=True, require_sour
     library_name = code or ('Local_' + sha(sch_path.read_bytes() + pcb_path.read_bytes())[:12])
     (output / (library_name + '.LibPkg')).write_text(project, encoding='utf-8-sig')
     report = {'generator_version': VERSION, 'lcsc': code, 'symbol': symbol, 'footprint': footprint, 'symbol_pin_count': len(pins), 'unique_pin_count': len(set(pins)), 'numbered_pad_count': len(pad_names), 'unique_pad_count': len(set(pad_names)), 'pin_map': {pin: pin for pin in dict.fromkeys(pins)}, 'embedded_models': models, 'bodies': bodies, 'source_schlib': str(sch_path), 'source_pcblib': str(pcb_path), 'source_schlib_sha256': sha(sch_path.read_bytes()), 'source_pcblib_sha256': sha(pcb_path.read_bytes()), 'original_symbol_geometry_sha256': sha(original_geometry), 'source_footprint_primitive_sha256': source_footprint_sha, 'footprint_primitive_sha256': sha(pcb[(fp_key, 'Data')]), 'model_placement': placement, 'project': str(output / (library_name + '.LibPkg')), 'intlib': str(output / (library_name + '.IntLib')), 'schlib': str(output / 'Part.SchLib'), 'pcblib': str(output / 'Footprint.PcbLib'), 'static_binding_validation': 'passed', 'native_ad_compile_verified': False, 'native_ad_placement_verified': False, 'three_dimensional_alignment_visually_verified': False}
+    report['symbol_units'] = units or {'count': int(geometry[0][2].get('PARTCOUNT', '2')) - 1}
     (output / 'binding-report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     return report
 
@@ -223,7 +243,12 @@ def fetch(code, cache, force=False, require_3d=True, progress=None, include_obj=
         pointer.write_text(json.dumps({'source': str(source)}), encoding='utf-8')
     out = cache / 'bound' / code / (datetime.datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:8])
     if progress: progress('Checking symbol, numbered pads and embedded STEP', 45)
-    report = prepare(next(source.rglob('*.SchLib')), next(source.rglob('*.PcbLib')), out, code, require_3d, require_source_geometry=True, progress=progress)
+    sch_files, pcb_files = list(source.rglob('*.SchLib')), list(source.rglob('*.PcbLib'))
+    if len(sch_files) != 1 or len(pcb_files) != 1: raise ValueError('Cached download contains multiple or missing libraries; refresh the source download')
+    source_rows = next(rows for key, data in read_streams(sch_files[0]).items() if len(key) == 2 and key[1] == 'Data' and (rows := list(records(data))) and rows[0][2].get('RECORD') == '1')
+    source_codes = set(re.findall(r'\bLCSC\s+(C\d+)\b', source_rows[0][2].get('COMPONENTDESCRIPTION', '')))
+    if source_codes and source_codes != {code}: raise ValueError('Cached symbol belongs to a different LCSC component; refresh the source download')
+    report = prepare(sch_files[0], pcb_files[0], out, code, require_3d, require_source_geometry=True, progress=progress)
     if progress: progress('Symbol, footprint, pin map and STEP verified', 65)
     return report
 

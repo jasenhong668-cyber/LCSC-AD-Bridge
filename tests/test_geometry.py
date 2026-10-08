@@ -10,7 +10,8 @@ SOURCE = ROOT / 'tests/fixtures/C7365889'
 @pytest.fixture(scope='module')
 def prepared(tmp_path_factory):
     folder = tmp_path_factory.mktemp('source-placement')
-    return bridge.prepare(next(SOURCE.rglob('*.SchLib')), next(SOURCE.rglob('*.PcbLib')), folder / 'incoming', 'C7365889', True, True)
+    sch = next(path for path in SOURCE.rglob('*.SchLib') if path.with_suffix('.step').exists())
+    return bridge.prepare(sch, sch.with_suffix('.PcbLib'), folder / 'incoming', 'C7365889', True, True)
 
 
 def test_source_transform_centers_rotates_and_offsets_in_millimeters():
